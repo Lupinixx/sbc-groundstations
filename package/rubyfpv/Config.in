@@ -1,0 +1,14 @@
+config BR2_PACKAGE_RUBYFPV
+    bool "rubyfpv"
+    select BR2_PACKAGE_ROCKCHIP_MPP
+    select BR2_PACKAGE_LIBDRM
+    select BR2_PACKAGE_CAIRO
+    select BR2_PACKAGE_LIBPCAP
+    select BR2_PACKAGE_LIBGPIOD
+    select BR2_PACKAGE_I2C_TOOLS
+    select BR2_PACKAGE_SDL2
+    depends on !BR2_PACKAGE_PIXELPILOT
+    help
+      RubyFPV ground station (Radxa/OpenIPC build).
+      Builds the station UI and radio processes targeting Rockchip/Radxa
+      boards using DRM+Cairo and Rockchip MPP.

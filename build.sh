@@ -9,12 +9,42 @@
 
 set -e
 
+# Sanitize PATH for Buildroot (WSL may inject Windows paths with spaces)
+# Buildroot fails if PATH contains spaces/TABs/newlines. Filter them out.
+sanitize_path() {
+    local newpath=""
+    local part
+    local saveifs="$IFS"
+    IFS=':'
+    for part in $PATH; do
+        case "$part" in
+            *[[:space:]]*|"")
+                # skip entries containing whitespace or empty
+                ;;
+            *)
+                if [ -z "$newpath" ]; then
+                    newpath="$part"
+                else
+                    newpath="$newpath:$part"
+                fi
+                ;;
+        esac
+    done
+    IFS="$saveifs"
+    printf '%s' "$newpath"
+}
+
+if printf '%s' "$PATH" | grep -q "[[:space:]]"; then
+    PATH="$(sanitize_path)"
+    export PATH
+fi
+
 # Default configuration
 BUILDROOT_VERSION="2025.08.1"
 BUILDROOT_SOURCE="https://buildroot.org/downloads/buildroot-${BUILDROOT_VERSION}.tar.gz"
 BUILDROOT_DIR="buildroot"
 BUILDROOT_TARBALL="buildroot-${BUILDROOT_VERSION}.tar.gz"
-DEFCONFIG="${DEFCONFIG:-runcam_wifilink_defconfig}"
+DEFCONFIG="${DEFCONFIG:-runcam_wifilink_rubyfpv_defconfig}"
 mkdir -p board/local/overlay/etc/network/interfaces.d
 
 # Parse command line options
@@ -73,6 +103,10 @@ build_project() {
     echo "Using output directory: $OUTPUT_DIR/$DEFCONFIG"
     build_cmd="make -C $BUILDROOT_DIR O=$OUTPUT_DIR/$DEFCONFIG"
     mkdir -p "$OUTPUT_DIR"
+
+    # Use a per-output downloads directory to avoid permission issues in buildroot/dl
+    export BR2_DL_DIR="$OUTPUT_DIR/dl"
+    mkdir -p "$BR2_DL_DIR"
     
     # Check if we're in a BR_EXTERNAL directory
     if [ ! -f "external.mk" ] && [ ! -f "external.desc" ]; then

@@ -1,0 +1,40 @@
+#!/bin/sh
+
+### BEGIN INIT INFO
+# Provides:          rubyfpv
+# Required-Start:    $remote_fs $syslog
+# Required-Stop:     $remote_fs $syslog
+# Default-Start:     5
+# Default-Stop:      0 1 6
+# Short-Description: Start RubyFPV ground station
+### END INIT INFO
+
+DAEMON_WRAPPER=/usr/bin/rubyfpv.sh
+PIDFILE=/var/run/rubyfpv.pid
+
+case "$1" in
+  start)
+    echo "Starting RubyFPV..."
+    start-stop-daemon -S -b -m -p "$PIDFILE" --exec "$DAEMON_WRAPPER" -- start
+    ;;
+  stop)
+    echo "Stopping RubyFPV..."
+    if [ -f "$PIDFILE" ]; then
+      start-stop-daemon -K -p "$PIDFILE" -s TERM
+      rm -f "$PIDFILE"
+    fi
+    # Ensure any residual RubyFPV processes are stopped
+    killall -q ruby_central ruby_rt_station ruby_controller ruby_rx_telemetry ruby_tx_rc ruby_player_radxa 2>/dev/null || true
+    ;;
+  restart)
+    $0 stop
+    sleep 1
+    $0 start
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+
+esac
+exit 0
