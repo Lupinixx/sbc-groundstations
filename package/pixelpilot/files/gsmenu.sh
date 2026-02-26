@@ -166,7 +166,7 @@ case "$@" in
         echo -n 0 1.5
         ;;
     "values air aalink channel")
-        echo -n -e "36\n40\n44\n48\n52\n56\n60\n64\n100\n104\n108\n112\n116\n120\n124\n128\n132\n136\n140\n144\n149\n153\n157\n161\n165\n36_40\n44_48\n52_56\n60_64\n100_104\n108_112\n116_120\n124_128\n132_136\n140_144\n149_153\n157_161"
+        echo -n -e "36\n40\n44\n48\n52\n56\n60\n64\n100\n104\n108\n112\n116\n120\n124\n128\n132\n136\n140\n144\n149\n153\n157\n161\n165\n36_40\n44_48\n52_56\n60_64\n100_104\n108_112\n116_120\n124_128\n132_136\n140_144\n149_153\n157_161\n36_48\n52_64\n100_112\n116_128\n132_144\n149_161"
         ;;
     "values air aalink SCALE_TX_POWER")
         echo -n 0.2 1.2
@@ -176,6 +176,9 @@ case "$@" in
         ;;
     "values air aalink OSD_SCALE")
         echo -n 0.2 2
+        ;;
+    "values air aalink OSD_LEVEL")
+        echo -n -e "0\n1\n2\n3"
         ;;
     "values air aalink THROUGHPUT_PCT")
         echo -n 0 100
@@ -208,7 +211,7 @@ case "$@" in
         echo -n -e "disabled\n50\n60"
         ;;
     "values air camera sensor_file")
-        echo -n -e "imx307\nimx335\nimx335_fpv\nimx415_fpv\nimx415_fpv\nimx415_milos10\nimx415_milos15\nimx335_milos12tweak\nimx335_greg15\nimx335_spike5\ngregspike05"
+        echo -n -e "imx335\nimx335_infinity6e\nimx415\nimx415_infinity6e"
         ;;
     "values air telemetry serial")
         echo -n -e "ttyS0\nttyS1\nttyS2\nttyS3"
@@ -507,7 +510,7 @@ case "$@" in
         ;;
     "get air wfbng air_channel")
         channel=$(get_wfb_value '.wireless.channel' | tr -d '\n')
-        iw list | grep "\[$channel\]" | tr -d '[]' | awk '{print $4 " (" $2 " " $3 ")"}' | sort -n | uniq | tr -d '\n'| head -c -1
+        iw list | grep "\[$channel\]" | tr -d '[]' | awk '{print $4 " (" $2 " " $3 ")"}' | sort -n | uniq | tr -d '\n'
         ;;
     "get air wfbng width")
         get_wfb_value '.wireless.width'
@@ -670,6 +673,9 @@ case "$@" in
         get_alink_value $4
         ;;
 
+    "get air aalink SHOW_SIGNAL_BARS")
+        [ "$(get_aalink_value 'SHOW_SIGNAL_BARS')" = "true" ] && echo 1 || echo 0
+        ;;
     "get air aalink channel")
         $SSH "fw_printenv -n wlanchan || echo 157"
         ;;
@@ -680,6 +686,22 @@ case "$@" in
 
     "set air aalink channel"*)
         echo "set_ap_channel $5" | nc -w 11 $REMOTE_IP 12355
+        ;;
+
+    "set air aalink SHOW_SIGNAL_BARS"*)
+        case "$5" in
+        on|true|1|yes)
+            val=true
+            ;;
+        off|false|0|no|"")
+            val=false
+            ;;
+        *)
+            val=false
+            ;;
+        esac
+
+        $SSH "sed -i 's/^SHOW_SIGNAL_BARS=.*/SHOW_SIGNAL_BARS=$val/' /etc/aalink.conf && kill -SIGHUP \$(pidof aalink)"
         ;;
 
     "set air alink"*)
@@ -711,6 +733,9 @@ case "$@" in
     "values gs wfbng txpower")
         echo -n -e "1\n100"
         ;;
+    "values gs system rx_codec")
+        echo -n -e "h264\nh265"
+        ;;
     "values gs system video_scale")
         echo -n 0.5 1.0
         ;;
@@ -726,7 +751,10 @@ case "$@" in
     "values gs system rec_fps")
         echo -n -e "60\n90\n120"
         ;;
-
+    "get gs system rx_codec")
+        . /etc/default/pixelpilot
+        echo $PIXELPILOT_CODEC
+    ;;
     "get gs system rx_mode")
         . /etc/default/wifibroadcast
         if [ x$WIFIBROADCAST_ENABLED = x"false" ]
@@ -747,6 +775,9 @@ case "$@" in
         . /etc/default/pixelpilot
         echo $PIXELPILOT_DVR_FRAMERATE
         ;;
+    "set gs system rx_codec"*)
+        sed -i "s/^PIXELPILOT_CODEC=.*/PIXELPILOT_CODEC=\"$5\"/" /etc/default/pixelpilot
+    ;;
     "set gs system rx_mode"*)
             EXCLUDE_IFACE="wlan0"
             SSID="${6:-OpenIPC}"
@@ -834,10 +865,22 @@ EOF
         sed -i "s/^PIXELPILOT_VIDEO_SCALE=.*/PIXELPILOT_VIDEO_SCALE=$5/" /etc/default/pixelpilot
         ;;
     "get gs wifi hotspot")
-        [ -f /etc/wpa_supplicant.hotspot.conf ] && echo 1 || echo 0
+        # Check if hotspot config exists AND wlan0 is up with an IP
+        if [ -f /etc/wpa_supplicant.hotspot.conf ] && ip addr show wlan0 2>/dev/null | grep -q "inet "; then
+            echo 1
+        else
+            echo 0
+        fi
         ;;
     "get gs wifi wlan")
-        [ -f /etc/network/interfaces.d/wlan0 -a ! -f /etc/wpa_supplicant.hotspot.conf ] && echo 1 || echo 0
+        # Check if wlan0 config exists AND wlan0 is up with an IP (and not hotspot mode)
+        if [ -f /etc/network/interfaces.d/wlan0 ] && \
+        [ ! -f /etc/wpa_supplicant.hotspot.conf ] && \
+        ip addr show wlan0 2>/dev/null | grep -q "inet "; then
+            echo 1
+        else
+            echo 0
+        fi
         ;;
     "get gs wifi ssid")
         if [ -f /etc/wpa_supplicant.conf ]; then
