@@ -1,0 +1,36 @@
+--- a/Makefile	2026-02-26 08:22:33.579665260 +0000
++++ b/Makefile	2026-02-26 08:22:51.030845771 +0000
+@@ -18,11 +18,11 @@
+ else
+ ifeq ($(RUBY_BUILD_ENV),radxa)
+ 
+-LDFLAGS_CENTRAL := -L/lib/aarch64-linux-gnu -lpthread -lrt -lm
++LDFLAGS_CENTRAL := -lpthread -lrt -lm
+ LDFLAGS_CENTRAL2 := -lpthread -lrt -lm
+ 
+ LDFLAGS_RENDERER := -ldrm -lcairo
+-CFLAGS_RENDERER := -I/usr/include/drm -I/usr/include/libdrm
++CFLAGS_RENDERER :=
+ CFLAGS_RENDERER += `pkg-config cairo --cflags`
+ _LDFLAGS := $(LDFLAGS) -lrt -lpcap -lpthread -li2c -lgpiod -Wl,--gc-sections 
+ _CFLAGS := $(_CFLAGS) -DRUBY_BUILD_HW_PLATFORM_RADXA
+@@ -30,8 +30,8 @@
+ 
+ _CPPFLAGS_NOSDL := $(_CPPFLAGS)
+ _LDFLAGS_NOSDL := $(_LDFLAGS)
+-_CPPFLAGS := $(_CPPFLAGS) -I/usr/include/SDL -D_GNU_SOURCE=1 -D_REENTRANT
+-_LDFLAGS := $(_LDFLAGS) -L/usr/lib/arm-linux-gnueabihf -lSDL
++_CPPFLAGS := $(_CPPFLAGS) -D_GNU_SOURCE=1 -D_REENTRANT
++_LDFLAGS := $(_LDFLAGS) -lSDL2
+ 
+ CENTRAL_RENDER_CODE := $(FOLDER_CENTRAL_RENDERER)/render_engine.o $(FOLDER_CENTRAL_RENDERER)/render_engine_cairo.o $(FOLDER_CENTRAL_RENDERER)/render_engine_ui.o $(FOLDER_CENTRAL_RENDERER)/drm_core.o
+ MODULE_LOC := $(FOLDER_COMMON)/strings_loc.o $(FOLDER_COMMON)/strings_table.o 
+@@ -54,7 +54,7 @@
+ endif
+ endif
+ 
+-INCLUDE_CENTRAL := -Imenu -Iosd -I../menu -I../osd -Icode/r_central/menu -Icode/r_central/osd -I../openvg -I/opt/vc/include/ -I/opt/vc/include/interface/vcos/pthreads -I/opt/vc/include/interface/vmcs_host/linux -I/usr/include/freetype2
++INCLUDE_CENTRAL := -Imenu -Iosd -I../menu -I../osd -Icode/r_central/menu -Icode/r_central/osd
+ 
+ FOLDER_START=code/r_start
+ FOLDER_RUTILS=code/r_utils
