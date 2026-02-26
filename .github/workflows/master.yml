@@ -25,6 +25,7 @@ jobs:
           - radxa_zero3
           - openipc_bonnet
           - runcam_wifilink
+          - runcam_wifilink_rubyfpv
           - emax_wyvern-link
 
     steps:
