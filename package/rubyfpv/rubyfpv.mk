@@ -40,58 +40,17 @@ endef
 
 RUBYFPV_POST_EXTRACT_HOOKS += RUBYFPV_REWRITE_DRM_INCLUDES
 
-# Ensure no stale local patches are applied (we rewrite sources instead)
-define RUBYFPV_STRIP_LOCAL_PATCHES
-	rm -f $(RUBYFPV_PKGDIR)/*.patch || true
-endef
-
-RUBYFPV_PRE_PATCH_HOOKS += RUBYFPV_STRIP_LOCAL_PATCHES
-
-# Remove host include/library paths that break cross-compilation
-define RUBYFPV_STRIP_HOST_PATHS
-	# Rewrite across all Makefiles in the tree
+# Fix hardcoded gcc/g++ in plugin shared-library targets (sub-makefiles)
+define RUBYFPV_FIX_PLUGIN_CC
 	find $(@D) \( -name Makefile -o -name "*.mk" \) -print0 | xargs -0 -I{} sh -c \
-	  "sed -i -E 's|[[:space:]]-I/usr/include/SDL\b||g' {} && \
-	   sed -i -E 's|[[:space:]]-I/usr/include/SDL2\b||g' {} && \
-	   sed -i -E 's|[[:space:]]-I/usr/include/libdrm\b||g' {} && \
-	   sed -i -E 's|[[:space:]]-I/usr/include/drm\b||g' {} && \
-	   sed -i -E 's|[[:space:]]-I/usr/include/freetype2\b||g' {} && \
-	   sed -i -E 's|[[:space:]]-I/opt/vc/include[^[:space:]]*||g' {} && \
-	   sed -i -E 's|[[:space:]]-L/usr/lib/arm-linux-gnueabihf\b||g' {} && \
-	   sed -i -E 's|[[:space:]]-L/usr/lib/aarch64-linux-gnu\b||g' {} && \
-	   sed -i -E 's|[[:space:]]-L/lib/aarch64-linux-gnu\b||g' {} && \
-	   sed -i -E 's|[[:space:]]-lSDL\b||g' {} && \
-	   # Ensure target compiler is used instead of host cc/gcc
-	   sed -i -E 's/(^|[^[:alnum:]_])gcc([^[:alnum:]_]|$)/\\1$(CC)\\2/g' {} && \
-	   sed -i -E 's/(^|[^[:alnum:]_])cc([^[:alnum:]_]|$)/\\1$(CC)\\2/g' {} && \
-	   # Let env CC override local definitions
-	   sed -i -E 's/^CC[[:space:]]*:?=([[:space:]]*)/CC ?=\1/g' {} " || true
+	  "sed -i -E 's|(^[[:space:]]*)gcc([[:space:]])|\1\$$(CC)\2|g' {} && \
+	   sed -i -E 's|(^[[:space:]]*)g\+\+([[:space:]])|\1\$$(CXX)\2|g' {}" || true
 endef
 
-RUBYFPV_POST_EXTRACT_HOOKS += RUBYFPV_STRIP_HOST_PATHS
+RUBYFPV_POST_PATCH_HOOKS += RUBYFPV_FIX_PLUGIN_CC
 
 # Build all station binaries for Radxa/DRM+Cairo path
 define RUBYFPV_BUILD_CMDS
-		# Fix upstream Makefiles before build: ensure cross tools and strip host paths
-		find $(@D) \( -name Makefile -o -name "*.mk" \) -print0 | \
-		while IFS= read -r -d '' f; do \
-			sed -i -E "s|^([[:space:]]*)gcc([[:space:]])|\\1$(TARGET_CC)\\2|g" "$${f}"; \
-			sed -i -E "s|^([[:space:]]*)cc([[:space:]])|\\1$(TARGET_CC)\\2|g" "$${f}"; \
-			sed -i -E "s|^([[:space:]]*)g\+\+([[:space:]])|\\1$(TARGET_CXX)\\2|g" "$${f}"; \
-			sed -i -E 's|[[:space:]]-I/opt/vc/include[^[:space:]]*||g' "$${f}"; \
-			sed -i -E 's|[[:space:]]-I/usr/include/SDL2||g' "$${f}"; \
-			sed -i -E 's|[[:space:]]-I/usr/include/SDL||g' "$${f}"; \
-			sed -i -E 's|[[:space:]]-I/usr/include/libdrm||g' "$${f}"; \
-			sed -i -E 's|[[:space:]]-I/usr/include/drm||g' "$${f}"; \
-			sed -i -E 's|[[:space:]]-I/usr/include/freetype2||g' "$${f}"; \
-		done
-
-		# Also patch the top Makefile explicitly
-		sed -i -E "s|^([[:space:]]*)gcc([[:space:]])|\\1$(TARGET_CC)\\2|g" $(@D)/Makefile
-		sed -i -E "s|^([[:space:]]*)cc([[:space:]])|\\1$(TARGET_CC)\\2|g" $(@D)/Makefile
-		sed -i -E "s|^([[:space:]]*)g\+\+([[:space:]])|\\1$(TARGET_CXX)\\2|g" $(@D)/Makefile
-		sed -i -E 's|-I/opt/vc[^ ]*||g' $(@D)/Makefile
-
 	# Clean to drop any stale host-arch objects
 	$(TARGET_MAKE_ENV) $(MAKE) -C $(@D) clean
 
@@ -125,6 +84,17 @@ define RUBYFPV_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/etc/init.d/S99rubyfpv
 	$(INSTALL) -D -m 0755 $(BR2_EXTERNAL_OPENIPC_SBC_GS_PATH)/package/rubyfpv/files/rubyfpv.sh \
 		$(TARGET_DIR)/usr/bin/rubyfpv.sh
+
+	# RubyFPV manages its own radio: disable wfb-ng to avoid conflicts.
+	# Replace WIFIBROADCAST_ENABLED if already set, otherwise append it.
+	mkdir -p $(TARGET_DIR)/etc/default
+	if [ -f $(TARGET_DIR)/etc/default/wifibroadcast ]; then \
+		sed -i 's/^WIFIBROADCAST_ENABLED=.*/WIFIBROADCAST_ENABLED=false/' \
+			$(TARGET_DIR)/etc/default/wifibroadcast; \
+	else \
+		echo 'WIFIBROADCAST_ENABLED=false' > $(TARGET_DIR)/etc/default/wifibroadcast; \
+	fi
 endef
 
 $(eval $(generic-package))
+
