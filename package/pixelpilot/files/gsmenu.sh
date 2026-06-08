@@ -695,6 +695,10 @@ case "$@" in
         echo $PIXELPILOT_DVR_FRAMERATE
         emit_values "60\n90\n120"
         ;;
+    "get gs system dvr_also_start_drone_recording")
+        . /etc/default/pixelpilot
+        [ "${PIXELPILOT_DVR_ALSO_START_DRONE_RECORDING:-0}" = "1" ] && echo 1 || echo 0
+        ;;
     "get gs system dvr_mode")
         . /etc/default/pixelpilot
         echo $PIXELPILOT_DVR_MODE
@@ -817,6 +821,17 @@ EOF
             : #noop
         else
             : #noop
+        fi
+        ;;
+    "set gs system dvr_also_start_drone_recording"*)
+        value=0
+        if [ "$5" = "on" ]; then
+            value=1
+        fi
+        if grep -q '^PIXELPILOT_DVR_ALSO_START_DRONE_RECORDING=' /etc/default/pixelpilot; then
+            sed -i "s/^PIXELPILOT_DVR_ALSO_START_DRONE_RECORDING=.*/PIXELPILOT_DVR_ALSO_START_DRONE_RECORDING=\"$value\"/" /etc/default/pixelpilot
+        else
+            echo "PIXELPILOT_DVR_ALSO_START_DRONE_RECORDING=\"$value\"" >> /etc/default/pixelpilot
         fi
         ;;
     "set gs system dvr_mode"*)
