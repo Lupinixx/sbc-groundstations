@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 set -o pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -10,7 +10,6 @@ AIR_FIRMWARE_TYPE="${AIR_FIRMWARE_TYPE:-wfb}"
 SSH_PASS="12345"
 CACHE_DIR="/tmp/gsmenu_cache"
 CACHE_TTL=10 # seconds
-MAJESTIC_YAML="/etc/majestic.yaml"
 WFB_YAML="/etc/wfb.yaml"
 ALINK_CONF="/etc/alink.conf"
 AALINK_CONF="/etc/aalink.conf"
@@ -21,7 +20,9 @@ TXPROFILES_CONF="/etc/txprofiles.conf"
 # ══════════════════════════════════════════════════════════════════════════════
 
 SSH="timeout -k 1 11 sshpass -p $SSH_PASS ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=/run/ssh_control:%h:%p:%r -o ControlPersist=15s -o ServerAliveInterval=3 -o ServerAliveCountMax=2 root@$REMOTE_IP"
-SCP="timeout -k 1 11 sshpass -p $SSH_PASS scp -O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=/run/ssh_control:%h:%p:%r -o ControlPersist=15s -o ServerAliveInterval=3 -o ServerAliveCountMax=2"
+SCP="timeout -k 1 11 sshpass -p $SSH_PASS scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=/run/ssh_control:%h:%p:%r -o ControlPersist=15s -o ServerAliveInterval=3 -o ServerAliveCountMax=2"
+API_CURL="curl -fsS --max-time 2"
+API_BASE_URL="http://${REMOTE_IP}/api/v1"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Helper functions
@@ -36,22 +37,128 @@ mkdir -p "$CACHE_DIR"
 emit_values()     { printf '\x1e'"$1"; }
 emit_values_cmd() { printf '\x1e'; "$@"; }
 
+waybeam_api_get() {
+    local endpoint="$1"
+    $API_CURL "${API_BASE_URL}/${endpoint}" 2>/dev/null
+}
+
+waybeam_mode_options() {
+    local modes_json
+    modes_json="$(waybeam_api_get "modes")" || return 1
+
+    printf '%s' "$modes_json" | jq -r '
+        if (.ok != true) or (.data == null) then empty else
+        .data as $d
+        | [($d.pads[]? | select(.pad == $d.selected_pad) | .modes[]?
+            | ((.index|tostring) + ": " + (.desc // ((.width|tostring) + "x" + (.height|tostring) + "@" + (.max_fps|tostring) + "fps"))))] as $modes
+        | (
+            if $d.selected_mode == -1 then
+                "-1: Auto (highest)"
+            else
+                (($modes[]? | select(startswith(($d.selected_mode|tostring) + ":")))
+                 // (($d.selected_mode|tostring) + ": selected"))
+            end
+          ) as $selected
+        | ([$selected] + ["-1: Auto (highest)"] + $modes)
+        | reduce .[] as $item ([];
+            if ($item == null or $item == "") then .
+            elif index($item) then .
+            else . + [$item]
+            end)
+        | .[]
+        end
+    '
+}
+
+waybeam_mode_index_from_label() {
+    printf '%s' "$1" | sed -n 's/^\([-0-9]\+\):.*/\1/p'
+}
+
+waybeam_set_config() {
+    local key="$1"
+    local value="$2"
+    if ! waybeam_api_get "set?${key}=${value}" >/dev/null; then
+        echo "Waybeam: failed to set ${key}=${value} (no response from drone)" >&2
+        return 1
+    fi
+}
+
+waybeam_record_active() {
+    waybeam_api_get "record/status" | grep -q '"active":[[:space:]]*true'
+}
+
+waybeam_record_start() {
+    waybeam_api_get "record/start" >/dev/null 2>&1
+}
+
+waybeam_record_stop() {
+    waybeam_api_get "record/stop" >/dev/null 2>&1
+}
+
+# Retry up to 3 times, checking /record/status after each attempt.
+# Runs the retries in a background subshell so the caller is not blocked.
+waybeam_record_set_with_retry_bg() {
+    local want="$1"
+    (
+        local i
+        for i in 1 2 3; do
+            if [ "$want" = "on" ]; then
+                waybeam_record_start
+                sleep 1
+                waybeam_record_active && break
+            else
+                waybeam_record_stop
+                sleep 1
+                waybeam_record_active || break
+            fi
+        done
+    ) &
+}
+
+waybeam_get_config() {
+    local key="$1"
+    local result
+    result="$(waybeam_api_get "get?${key}" | jq -r '.data.value // empty')"
+    if [ -z "$result" ]; then
+        echo "Waybeam: no response for config key '${key}'" >&2
+    fi
+    echo "$result"
+}
+
+waybeam_restart() {
+    # Encoder reinit can briefly drop the connection; use longer timeout and
+    # suppress failures (HTTP errors during reinit are expected, not real errors).
+    curl -sS --max-time 5 "${API_BASE_URL}/restart" >/dev/null 2>&1 || true
+}
+
+waybeam_get_iq() {
+    local param="$1"
+    local result
+    result="$(waybeam_api_get "iq" | jq -r --arg p "$param" '.data[] | select(.param==$p) | .value // empty' 2>/dev/null)"
+    if [ -z "$result" ]; then
+        echo "Waybeam: no response for IQ param '${param}'" >&2
+    fi
+    echo "$result"
+}
+
+waybeam_set_iq() {
+    local param="$1"
+    local value="$2"
+    if ! waybeam_api_get "iq/set?param=${param}&value=${value}" >/dev/null; then
+        echo "Waybeam: failed to set IQ ${param}=${value} (no response from drone)" >&2
+        return 1
+    fi
+}
+
 # Refresh cached config files from the air unit (10s TTL)
 refresh_cache() {
     local current_time=$(date +%s)
     local last_refresh=$((current_time - CACHE_TTL))
 
     if [[ ! -f "$CACHE_DIR/last_refresh" ]] || [[ $(cat "$CACHE_DIR/last_refresh") -lt $last_refresh ]]; then
-        files="$MAJESTIC_YAML $WFB_YAML $ALINK_CONF $TXPROFILES_CONF $AALINK_CONF"
-        $SSH "tar cf - $files" 2>/dev/null | tar xf - --strip-components 1 -C /tmp/gsmenu_cache/ 2>/dev/null
-        $SSH "find /etc/sensors/ -type f -name \"*\$(ipcinfo -s)*.bin\"" | sed 's/^\/etc\/sensors\///' | sed 's/\.bin$//' > /tmp/gsmenu_cache/sensor.txt
+        $SCP root@$REMOTE_IP:$WFB_YAML root@$REMOTE_IP:$ALINK_CONF root@$REMOTE_IP:$TXPROFILES_CONF root@$REMOTE_IP:$AALINK_CONF $CACHE_DIR 2>/dev/null
         echo "$current_time" > "$CACHE_DIR/last_refresh"
     fi
-}
-
-get_majestic_value() {
-    local key="$1"
-    yaml-cli -i "$CACHE_DIR/majestic.yaml" -g "$key" 2>/dev/null
 }
 
 get_wfb_value() {
@@ -71,7 +178,7 @@ get_aalink_value() {
 
 # Helper: list available wifi channels (used by air and gs)
 list_wifi_channels() {
-    iw list | grep MHz | grep -v disabled | grep -v "radar detection" | grep \* | tr -d '[]' | awk '{print $4 " (" $2 " " $3 ")"}' | grep '^[1-9]' | sort -n | uniq | head -c -1
+    iw list | grep MHz | grep -v disabled | grep -v "radar detection" | grep \* | tr -d '[]' | awk '{print $4 " (" $2 " " $3 ")"}' | grep '^[1-9]' | sort -n | uniq | sed -z '$ s/\n$//'
 }
 
 # Add or update a network stanza in wpa_supplicant.conf.
@@ -105,11 +212,6 @@ wpa_conf_update_network() {
     fi
     mv "$tmpfile" "$conf"
 }
-
-send_cmd() {
-    echo "$1" | nc -w 11 $REMOTE_IP 12355
-}
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Cache refresh (only for air get commands)
@@ -177,7 +279,7 @@ case "$@" in
         $SSH wifibroadcast cli -s .wireless.channel $channel
         $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
         sed -i "s/^wifi_channel =.*/wifi_channel = $channel/" /etc/wifibroadcast.cfg
-        /etc/init.d/S98wifibroadcast restart
+        systemctl restart wifibroadcast.service
         ;;
     "set air wfbng width"*)
         $SSH wifibroadcast cli -s .wireless.width $5
@@ -217,173 +319,192 @@ case "$@" in
         ;;
     "set air wfbng adaptivelink"*)
         if [ "$5" = "on" ]; then
-            $SSH 'sed -i "/alink_drone &/d" /etc/rc.local && sed -i -e "\$i alink_drone &" /etc/rc.local && cli -s .video0.qpDelta -12 && killall -1 majestic && (nohup alink_drone >/dev/null 2>&1 &)'
+            $SSH 'sed -i "/alink_drone &/d" /etc/rc.local && sed -i -e "\$i alink_drone &" /etc/rc.local && (nohup alink_drone >/dev/null 2>&1 &)'
+            waybeam_set_config "video0.qpDelta" "-12"
         else
-            $SSH 'killall -q -9 alink_drone;  sed -i "/alink_drone &/d" /etc/rc.local  ; cli -d .video0.qpDelta && killall -1 majestic'
+            $SSH 'killall -q -9 alink_drone; sed -i "/alink_drone &/d" /etc/rc.local'
+            waybeam_set_config "video0.qpDelta" "0"
         fi
         ;;
 
 # ── Air: Camera ──────────────────────────────────────────────────────────────
 
     "get air camera mirror")
-        [ "$(get_majestic_value '.image.mirror')" = "true" ] && echo 1 || echo 0
+        [ "$(waybeam_get_config 'image.mirror')" = "true" ] && echo 1 || echo 0
         ;;
     "get air camera flip")
-        [ "$(get_majestic_value '.image.flip')" = "true" ] && echo 1 || echo 0
+        [ "$(waybeam_get_config 'image.flip')" = "true" ] && echo 1 || echo 0
         ;;
     "get air camera contrast")
-        get_majestic_value '.image.contrast'
-        emit_values "0 100"
+        waybeam_get_iq 'contrast'
+        emit_values "0 255"
         ;;
-    "get air camera hue")
-        get_majestic_value '.image.hue'
-        emit_values "0 100"
+    "get air camera brightness")
+        waybeam_get_iq 'brightness'
+        emit_values "0 255"
         ;;
     "get air camera saturation")
-        get_majestic_value '.image.saturation'
-        emit_values "0 100"
+        waybeam_get_iq 'saturation'
+        emit_values "0 255"
         ;;
-    "get air camera luminace")
-        get_majestic_value '.image.luminance'
-        emit_values "0 100"
+    "get air camera lightness")
+        waybeam_get_iq 'lightness'
+        emit_values "0 255"
         ;;
-    "get air camera size")
-        get_majestic_value '.video0.size'
-        emit_values "1280x720\n1456x816\n1920x1080\n1440x1080\n1920x1440\n2104x1184\n2208x1248\n2240x1264\n2312x1304\n2436x1828\n2512x1416\n2560x1440\n2560x1920\n2720x1528\n2944x1656\n3200x1800\n3840x2160"
+    "get air camera sharpness")
+        waybeam_get_iq 'sharpness'
+        emit_values "0 255"
         ;;
-    "get air camera video_mode")
-        send_cmd get_current_video_mode
-        emit_values_cmd send_cmd get_all_video_modes
+    "get air camera hsv")
+        waybeam_get_iq 'hsv'
+        emit_values "0 255"
         ;;
-    "get air camera fps")
-        get_majestic_value '.video0.fps'
-        emit_values "60\n90\n120"
+    "get air camera mode")
+        mode_options="$(waybeam_mode_options)"
+        if [ -n "$mode_options" ]; then
+            current_mode="$(printf '%s\n' "$mode_options" | head -n1)"
+            echo "$current_mode"
+            emit_values "$mode_options"
+        else
+            echo "-1: Auto (highest)"
+            emit_values "-1: Auto (highest)"
+        fi
         ;;
     "get air camera bitrate")
-        get_majestic_value '.video0.bitrate'
-        emit_values "1000\n2000\n3000\n4000\n5000\n6000\n7000\n8000\n9000\n10000\n11000\n12000\n13000\n14000\n15000\n16000\n17000\n18000\n19000\n20000\n21000\n22000\n23000\n24000\n25000\n26000\n27000\n28000\n29000\n30000"
+        waybeam_get_config 'video0.bitrate'
+        emit_values "1024\n2048\n3072\n4096\n5120\n6144\n7168\n8192\n9216\n10240\n11264\n12288\n13312\n14336\n15360\n16384\n17408\n18432\n19456\n20480\n21504\n22528\n23552\n24576\n25600\n26624\n27648\n28672\n29692\n30720"
         ;;
     "get air camera codec")
-        get_majestic_value '.video0.codec'
+        echo "h265"
         emit_values "h264\nh265"
         ;;
     "get air camera gopsize")
-        get_majestic_value '.video0.gopSize'
+        waybeam_get_config 'video0.gopSize'
         emit_values "0 10"
         ;;
     "get air camera rc_mode")
-        get_majestic_value '.video0.rcMode'
-        emit_values "vbr\navbr\ncbr"
+        waybeam_get_config 'video0.rcMode'
+        emit_values "vbr\navbr\ncbr\nqvbr"
         ;;
     "get air camera rec_enable")
-        [ "$(get_majestic_value '.records.enabled')" = "true" ] && echo 1 || echo 0
+        if waybeam_record_active; then
+            echo 1
+        else
+            echo 0
+        fi
         ;;
     "get air camera rec_split")
-        get_majestic_value '.records.split'
-        emit_values "0 60"
+        waybeam_get_config 'record.maxSeconds'
+        emit_values "0 300"
         ;;
     "get air camera rec_maxusage")
-        get_majestic_value '.records.maxUsage'
-        emit_values "0 100"
+        waybeam_get_config 'record.maxMB'
+        emit_values "0 10000"
         ;;
     "get air camera exposure")
-        get_majestic_value '.isp.exposure'
+        # Exposure control is hidden in UI; pending waybeam IQ AE investigation
+        echo ""
         emit_values "5 50"
         ;;
     "get air camera antiflicker")
-        get_majestic_value '.isp.antiFlicker'
+        waybeam_get_iq 'ae_flicker'
         emit_values "disabled\n50\n60"
         ;;
     "get air camera sensor_file")
-        basename -s .bin $(basename $(get_majestic_value '.isp.sensorConfig'))
-        emit_values "$(cat /tmp/gsmenu_cache/sensor.txt)"
+        waybeam_get_config 'isp.sensorBin'
+        emit_values "imx307\nimx335\nimx335_fpv\nimx415_fpv\nimx415_milos10\nimx415_milos15\nimx335_milos12tweak\nimx335_greg15\nimx335_spike5\ngregspike05"
         ;;
     "get air camera fpv_enable")
-        get_majestic_value '.fpv.enabled' | grep -q true && echo 1 || echo 0
+        [ "$(waybeam_get_config 'fpv.roiEnabled')" = "true" ] && echo 1 || echo 0
         ;;
     "get air camera noiselevel")
-        get_majestic_value '.fpv.noiseLevel'
-        emit_values "0 1"
+        waybeam_get_config 'fpv.noiseLevel'
+        emit_values "0 7"
         ;;
 
     "set air camera mirror"*)
         if [ "$5" = "on" ]; then
-            $SSH 'cli -s .image.mirror true && killall -1 majestic'
+            waybeam_set_config "image.mirror" "true"
         else
-            $SSH 'cli -s .image.mirror false && killall -1 majestic'
+            waybeam_set_config "image.mirror" "false"
         fi
+        waybeam_restart
         ;;
     "set air camera flip"*)
         if [ "$5" = "on" ]; then
-            $SSH 'cli -s .image.flip true && killall -1 majestic'
+            waybeam_set_config "image.flip" "true"
         else
-            $SSH 'cli -s .image.flip false && killall -1 majestic'
+            waybeam_set_config "image.flip" "false"
         fi
+        waybeam_restart
         ;;
     "set air camera contrast"*)
-        $SSH "cli -s .image.contrast $5 && killall -1 majestic"
+        waybeam_set_iq "contrast" "$5"
         ;;
-    "set air camera hue"*)
-        $SSH "cli -s .image.hue $5 && killall -1 majestic"
+    "set air camera brightness"*)
+        waybeam_set_iq "brightness" "$5"
         ;;
     "set air camera saturation"*)
-        $SSH "cli -s .image.saturation $5 && killall -1 majestic"
+        waybeam_set_iq "saturation" "$5"
         ;;
-    "set air camera luminace"*)
-        $SSH "cli -s .image.luminance $5 && killall -1 majestic"
+    "set air camera lightness"*)
+        waybeam_set_iq "lightness" "$5"
         ;;
-    "set air camera size"*)
-        $SSH "cli -s .video0.size $5 && killall -1 majestic"
+    "set air camera sharpness"*)
+        waybeam_set_iq "sharpness" "$5"
         ;;
-    "set air camera video_mode"*)
-        echo set_simple_video_mode "$5" | nc -w 11 $REMOTE_IP 12355
+    "set air camera hsv"*)
+        waybeam_set_iq "hsv" "$5"
         ;;
-    "set air camera fps"*)
-        $SSH "cli -s .video0.fps $5 && killall -1 majestic"
+    "set air camera mode"*)
+        mode_index="$(waybeam_mode_index_from_label "$5")"
+        [ -n "$mode_index" ] || mode_index="$5"
+        waybeam_set_config "sensor.mode" "$mode_index"
         ;;
     "set air camera bitrate"*)
-        $SSH "cli -s .video0.bitrate $5 && killall -1 majestic"
+        waybeam_set_config "video0.bitrate" "$5"
         ;;
     "set air camera codec"*)
-        $SSH "cli -s .video0.codec $5 && killall -1 majestic"
+        # Codec selection not supported by Waybeam (H.265-only on star6e); no-op
         ;;
     "set air camera gopsize"*)
-        $SSH "cli -s .video0.gopSize $5 && killall -1 majestic"
+        waybeam_set_config "video0.gopSize" "$5"
         ;;
     "set air camera rc_mode"*)
-        $SSH "cli -s .video0.rcMode $5 && killall -1 majestic"
+        waybeam_set_config "video0.rcMode" "$5"
+        waybeam_restart
         ;;
     "set air camera rec_enable"*)
-        if [ "$5" = "on" ]; then
-            $SSH 'cli -s .records.enable true && killall -1 majestic'
-        else
-            $SSH 'cli -s .records.enable false && killall -1 majestic'
-        fi
+        waybeam_record_set_with_retry_bg "$5"
         ;;
     "set air camera rec_split"*)
-        $SSH "cli -s .records.split $5 && killall -1 majestic"
+        waybeam_set_config "record.maxSeconds" "$5"
+        waybeam_restart
         ;;
     "set air camera rec_maxusage"*)
-        $SSH "cli -s .records.maxUsage $5 && killall -1 majestic"
+        waybeam_set_config "record.maxMB" "$5"
+        waybeam_restart
         ;;
     "set air camera exposure"*)
-        $SSH "cli -s .isp.exposure $5 && killall -1 majestic"
+        # Exposure control is hidden in UI; pending waybeam IQ AE investigation
         ;;
     "set air camera antiflicker"*)
-        $SSH "cli -s .isp.antiFlicker $5 && killall -1 majestic"
+        waybeam_set_iq "ae_flicker" "$5"
         ;;
     "set air camera sensor_file"*)
-        $SSH "cli -s .isp.sensorConfig /etc/sensors/${5}.bin && killall -1 majestic"
+        waybeam_set_config "isp.sensorBin" "$5"
+        waybeam_restart
         ;;
     "set air camera fpv_enable"*)
         if [ "$5" = "on" ]; then
-            $SSH 'cli -s .fpv.enabled true && killall -1 majestic'
+            waybeam_set_config "fpv.roiEnabled" "true"
         else
-            $SSH 'cli -s .fpv.enabled false && killall -1 majestic'
+            waybeam_set_config "fpv.roiEnabled" "false"
         fi
         ;;
     "set air camera noiselevel"*)
-        $SSH "cli -s .fpv.noiseLevel $5 && killall -1 majestic"
+        waybeam_set_config "fpv.noiseLevel" "$5"
+        waybeam_restart
         ;;
 
 # ── Air: Telemetry ───────────────────────────────────────────────────────────
@@ -521,8 +642,8 @@ case "$@" in
         [ "$(get_aalink_value 'SHOW_SIGNAL_BARS')" = "true" ] && echo 1 || echo 0
         ;;
     "get air aalink channel")
-        send_cmd get_current_ap_channel
-        emit_values_cmd send_cmd get_all_ap_channels
+        $SSH "fw_printenv -n wlanchan || echo 157"
+        emit_values "36\n40\n44\n48\n52\n56\n60\n64\n100\n104\n108\n112\n116\n120\n124\n128\n132\n136\n140\n144\n149\n153\n157\n161\n165\n36_40\n44_48\n52_56\n60_64\n100_104\n108_112\n116_120\n124_128\n132_136\n140_144\n149_153\n157_161"
         ;;
     "get air aalink SCALE_TX_POWER")
         get_aalink_value SCALE_TX_POWER
@@ -567,14 +688,14 @@ case "$@" in
         $SSH "sed -i 's/^SHOW_SIGNAL_BARS=.*/SHOW_SIGNAL_BARS=$val/' /etc/aalink.conf && kill -SIGHUP \$(pidof aalink)"
         ;;
     "set air aalink"*)
-        $SSH 'sed -i "s/^'$4'=.*/'$4'='$5'/" /etc/aalink.conf; kill -SIGHUP $(pidof aalink)'
+        $SSH 'sed -i "s/'$4'=.*/'$4'='$5'/" /etc/aalink.conf; kill -SIGHUP $(pidof aalink)'
         ;;
 
 # ── GS: WFB-NG ──────────────────────────────────────────────────────────────
 
     "get gs wfbng gs_channel")
         channel=$(grep wifi_channel /etc/wifibroadcast.cfg | cut -d ' ' -f 3)
-        iw list | grep "\[$channel\]" | tr -d '[]' | awk '{print $4 " (" $2 " " $3 ")"}' | sort -n | uniq | head -c -1
+        iw list | grep "\[$channel\]" | tr -d '[]' | awk '{print $4 " (" $2 " " $3 ")"}' | sort -n | uniq
         emit_values_cmd list_wifi_channels
         ;;
     "get gs wfbng bandwidth")
@@ -589,10 +710,10 @@ case "$@" in
             read first_card first_card_power < <(
                 echo "$wifi_txpower" | cut -d = -f 2 | jq -r '"\(to_entries[0].key) \(to_entries[0].value)"'
             )
-            first_card_type=$(udevadm info /sys/class/net/${first_card} | grep -E 'ID_USB_DRIVER=(rtl88xxau_wfb|rtl88x2eu|rtl88x2cu)'| cut -d = -f2)
+            first_card_type=$(udevadm info /sys/class/net/${first_card}/ | grep -E 'ID_NET_DRIVER=(rtl88xxau_wfb|rtl88x2eu)'| cut -d = -f2)
             case "$first_card_type" in
             "rtl88xxau_wfb") min_phy_txpower=-1000; max_phy_txpower=-3000 ;;
-            "rtl88x2eu"|"rtl88x2cu") min_phy_txpower=1000; max_phy_txpower=2900 ;;
+            "rtl88x2eu")     min_phy_txpower=1000;  max_phy_txpower=2900  ;;
             esac
             range=$((max_phy_txpower - min_phy_txpower))
             position=$((first_card_power - min_phy_txpower))
@@ -602,12 +723,7 @@ case "$@" in
         emit_values "1\n100"
         ;;
     "get gs wfbng adaptivelink")
-        . /etc/default/adaptive-link
-        if [ x$ADAPTIVE_LINK_ENABLED = x"false" ]; then
-           echo "0"
-        else
-            echo "1"
-        fi
+        systemctl is-active --quiet alink_gs.service && echo 1 || echo 0
         ;;
 
     "set gs wfbng gs_channel"*)
@@ -617,21 +733,21 @@ case "$@" in
             $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
         fi
         sed -i "s/^wifi_channel =.*/wifi_channel = $channel/" /etc/wifibroadcast.cfg
-        /etc/init.d/S98wifibroadcast restart
+        systemctl restart wifibroadcast.service
         ;;
     "set gs wfbng bandwidth"*)
         sed -i "s/^bandwidth = .*/bandwidth = $5/" /etc/wifibroadcast.cfg
-        /etc/init.d/S98wifibroadcast restart
+        systemctl restart wifibroadcast.service
         ;;
     "set gs wfbng txpower"*)
         .  /etc/default/wifibroadcast
         wifi_txpower=""
         for nic in $WFB_NICS
         do
-            card_type=$(udevadm info /sys/class/net/${nic} | grep -E 'ID_USB_DRIVER=(rtl88xxau_wfb|rtl88x2eu|rtl88x2cu)'| cut -d = -f2)
+            card_type=$(udevadm info /sys/class/net/${nic}/ | grep -E 'ID_NET_DRIVER=(rtl88xxau_wfb|rtl88x2eu)'| cut -d = -f2)
             case "$card_type" in
             "rtl88xxau_wfb") min_phy_txpower=-1000; max_phy_txpower=-3000 ;;
-            "rtl88x2eu"|"rtl88x2cu") min_phy_txpower=1000; max_phy_txpower=2900 ;;
+            "rtl88x2eu")     min_phy_txpower=1000;  max_phy_txpower=2900  ;;
             esac
             range=$((max_phy_txpower - min_phy_txpower))
             percentage=$5
@@ -644,37 +760,30 @@ case "$@" in
         else
             sed -i "s/^wifi_txpower = .*/wifi_txpower = {$wifi_txpower}/" /etc/wifibroadcast.cfg
         fi
-        /etc/init.d/S98wifibroadcast restart
+        systemctl restart wifibroadcast.service
         ;;
     "set gs wfbng adaptivelink"*)
         if [ "$5" = "on" ]; then
-            sed -i 's/ADAPTIVE_LINK_ENABLED.*/ADAPTIVE_LINK_ENABLED=true/' /etc/default/adaptive-link
-            /etc/init.d/S98adaptive-link start
+            systemctl start alink_gs.service
+            systemctl enable alink_gs.service
         else
-            /etc/init.d/S98adaptive-link stop
-            sed -i 's/ADAPTIVE_LINK_ENABLED.*/ADAPTIVE_LINK_ENABLED=false/' /etc/default/adaptive-link
+            systemctl stop alink_gs.service
+            systemctl disable alink_gs.service
         fi
         ;;
 
 # ── GS: System ──────────────────────────────────────────────────────────────
 
     "get gs system rx_codec")
-        . /etc/default/pixelpilot
-        echo $PIXELPILOT_CODEC
-        emit_values "h264\nh265"
+        echo "h265"
+        emit_values "h265"
         ;;
     "get gs system rx_mode")
-        . /etc/default/wifibroadcast
-        if [ x$WIFIBROADCAST_ENABLED = x"false" ]; then
-           echo "apfpv"
-        else
-            echo "wfb"
-        fi
+        systemctl is-enabled --quiet wifibroadcast && echo wfb || echo apfpv
         emit_values "wfb\napfpv"
         ;;
     "get gs system gs_rendering")
-        . /etc/default/msposd
-        [ x$MSPOSD_ENABLED = x"false" ] && echo 0 || echo 1
+        [ "$(grep ^render /config/setup.txt | cut -d ' ' -f 3)" = "ground" ] && echo 1 || echo 0
         ;;
     "get gs system connector")
         echo HDMI
@@ -683,138 +792,98 @@ case "$@" in
     "get gs system resolution")
         drm_info -j /dev/dri/card0 2>/dev/null | jq -r '."/dev/dri/card0".crtcs[0].mode| .name + "@" + (.vrefresh|tostring)'
         printf '\x1e'
-        drm_info -j /dev/dri/card0 2>/dev/null | jq -r '."/dev/dri/card0".connectors[1].modes[] | select(.name | contains("i") | not) | .name + "@" + (.vrefresh|tostring)' | sort | uniq | head -c -1
+        drm_info -j /dev/dri/card0 2>/dev/null | jq -r '."/dev/dri/card0".connectors[1].modes[] | select(.name | contains("i") | not) | .name + "@" + (.vrefresh|tostring)' | sort | uniq | sed -z '$ s/\n$//'
         ;;
     "get gs system video_scale")
-        . /etc/default/pixelpilot
-        echo $PIXELPILOT_VIDEO_SCALE
+        grep "^video_scale =" /config/setup.txt | cut -d '=' -f2 | xargs
         emit_values "0.5 1.0"
         ;;
     "get gs system rec_fps")
-        . /etc/default/pixelpilot
-        echo $PIXELPILOT_DVR_FRAMERATE
+        grep ^rec_fps /config/setup.txt | cut -d ' ' -f 3
         emit_values "60\n90\n120"
-        ;;
-    "get gs system dvr_also_start_drone_recording")
-        . /etc/default/pixelpilot
-        [ "${PIXELPILOT_DVR_ALSO_START_DRONE_RECORDING:-0}" = "1" ] && echo 1 || echo 0
-        ;;
-    "get gs system dvr_mode")
-        . /etc/default/pixelpilot
-        echo $PIXELPILOT_DVR_MODE
-        emit_values "raw\nreencode\nboth"
-        ;;
-    "get gs system dvr_max_size")
-        . /etc/default/pixelpilot
-        echo $(( $PIXELPILOT_DVR_MAX_SIZE / 100 ))
-        emit_values "1 40"
-        ;;
-    "get gs system dvr_reenc_codec")
-        . /etc/default/pixelpilot
-        echo $PIXELPILOT_DVR_CODEC
-        emit_values "h264\nh265"
-        ;;
-    "get gs system dvr_reenc_resolution")
-        . /etc/default/pixelpilot
-        echo $PIXELPILOT_DVR_RESOLUTION
-        emit_values "720p\n1080p"
-        ;;
-    "get gs system dvr_reenc_fps")
-        . /etc/default/pixelpilot
-        echo $PIXELPILOT_DVR_FPS
-        emit_values "30\n60"
-        ;;
-    "get gs system dvr_reenc_bitrate")
-        . /etc/default/pixelpilot
-        echo $PIXELPILOT_DVR_BITRATE
-        emit_values "5000\n10000\n15000\n20000\n25000\n30000\n35000\n40000\n45000\n50000"
         ;;
 
     "set gs system rx_codec"*)
-        sed -i "s/^PIXELPILOT_CODEC=.*/PIXELPILOT_CODEC=\"$5\"/" /etc/default/pixelpilot
-        ;;
-    "set gs system gs_live_colortrans"*)
-        if [ "$5" = "on" ]
-        then
-            sed -i "s/^PIXELPILOT_LIVE_COLORTRANS=.*/PIXELPILOT_LIVE_COLORTRANS=\"--live-colortrans\"/" /etc/default/pixelpilot
-        else
-            sed -i "s/^PIXELPILOT_LIVE_COLORTRANS=.*/PIXELPILOT_LIVE_COLORTRANS=\"\"/" /etc/default/pixelpilot
-        fi
+        : # noop
         ;;
     "set gs system rx_mode"*)
         EXCLUDE_IFACE="wlan0"
         SSID="${6:-OpenIPC}"
         PASSWORD="${7:-12345678}"
         if [ "$5" = "apfpv" ]; then
-            /etc/init.d/S98adaptive-link stop
-            /etc/init.d/S98wifibroadcast stop
-            sed -i 's/WIFIBROADCAST_ENABLED.*/WIFIBROADCAST_ENABLED=false/' /etc/default/wifibroadcast
-            sed -i 's/ADAPTIVE_LINK_ENABLED.*/ADAPTIVE_LINK_ENABLED=false/' /etc/default/adaptive-link
+            systemctl stop alink_gs.service
+            systemctl stop wifibroadcast.service
+            systemctl stop wifibroadcast@gs.service
+            systemctl disable wifibroadcast.service
+            systemctl disable wifibroadcast@gs.service
+            systemctl disable alink_gs.service
             rmmod 8812eu
             rmmod 88XXau_wfb
             modprobe 8812eu
             modprobe 88XXau_wfb
-            cat <<EOF > /etc/wpa_supplicant.apfpv.conf
-network={
-    ssid="$SSID"
-    psk="$PASSWORD"
-}
-
-EOF
             WIFI_IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep '^wlx' | grep -v "^$EXCLUDE_IFACE$")
             INDEX=0
             for IFACE in $WIFI_IFACES; do
-cat <<EOF > /etc/network/interfaces.d/$IFACE
-$( [ $INDEX -eq 0 ] && echo "auto $IFACE" || echo "#auto $IFACE")
-iface $IFACE inet dhcp
-  wpa-conf /etc/wpa_supplicant.apfpv.conf
-  udhcpc_opts -s /etc/udhcpc/udhcpc.apfpv.script
-
-EOF
-            [ $INDEX -eq 0 ] && ifup $IFACE
-            INDEX=$((INDEX + 1))
+                nmcli device set $IFACE managed yes
+                CONN_NAME="apfpv$INDEX"
+                if nmcli connection show "$CONN_NAME" &>/dev/null; then
+                    nmcli connection modify "$CONN_NAME" connection.autoconnect $([ "$INDEX" -eq 0 ] && echo "yes" || echo "no")
+                else
+                    nmcli device wifi rescan ifname "$IFACE"
+                    sleep 2
+                    nmcli connection add type wifi ifname "$IFACE" con-name "$CONN_NAME" ssid "$SSID" \
+                        wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$PASSWORD" \
+                        ipv4.method auto connection.autoconnect $([ "$INDEX" -eq 0 ] && echo "yes" || echo "no")
+                fi
+                nmcli connection modify "$CONN_NAME" ipv4.route-metric $((100 * (INDEX + 1)))
+                INDEX=$((INDEX + 1))
             done
+            ln -s /usr/local/bin/gsmenu.sh /etc/NetworkManager/dispatcher.d/
+            nmcli -w 0 connection up apfpv0
         elif [ "$5" = "wfb" ]; then
+            rm /etc/NetworkManager/dispatcher.d/gsmenu.sh
             WIFI_IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep -E '^wlx' | grep -v "^$EXCLUDE_IFACE$")
             INDEX=0
             for IFACE in $WIFI_IFACES; do
-                ifdown $IFACE
-                rm /etc/network/interfaces.d/$IFACE
+                CONN_NAME="apfpv$INDEX"
+                if nmcli connection show "$CONN_NAME" &>/dev/null; then
+                    nmcli connection modify "$CONN_NAME" connection.autoconnect no
+                    nmcli connection down "$IFACE"
+                fi
+                INDEX=$((INDEX + 1))
             done
             rmmod 8812eu
             rmmod 88XXau_wfb
             modprobe 8812eu
             modprobe 88XXau_wfb
-            sed -i 's/WIFIBROADCAST_ENABLED.*/WIFIBROADCAST_ENABLED=true/' /etc/default/wifibroadcast
-            sed -i 's/ADAPTIVE_LINK_ENABLED.*/ADAPTIVE_LINK_ENABLED=true/' /etc/default/adaptive-link
-            /etc/init.d/S98adaptive-link start
-            /etc/init.d/S98wifibroadcast start
+            systemctl start wifibroadcast.service
+            systemctl start wifibroadcast@gs.service
+            systemctl start alink_gs.service
+            systemctl enable wifibroadcast.service
+            systemctl enable wifibroadcast@gs.service
+            systemctl enable alink_gs.service
         fi
         ;;
     "set gs system gs_rendering"*)
         if [ "$5" = "off" ]; then
-            /etc/init.d/S98msposd stop
-            sed -i 's/MSPOSD_ENABLED.*/MSPOSD_ENABLED=false/' /etc/default/msposd
+            sed -i 's/^render =.*/render = air/' /config/setup.txt
+            kill -9 $(pidof msposd_rockchip)
         else
-            sed -i 's/MSPOSD_ENABLED.*/MSPOSD_ENABLED=true/' /etc/default/msposd
-            /etc/init.d/S98msposd start
+            sed -i 's/^render =.*/render = ground/' /config/setup.txt
+            msposd_rockchip --osd --ahi 0 --matrix 11 -v -r 5 --master 0.0.0.0:14551 &
         fi
         ;;
-    "set gs system gs_live_colortrans"*)
-        if [ "$5" = "on" ]; then
-            sed -i "s/^PIXELPILOT_LIVE_COLORTRANS=.*/PIXELPILOT_LIVE_COLORTRANS=\"--live-colortrans\"/" /etc/default/pixelpilot
-        else
-            sed -i "s/^PIXELPILOT_LIVE_COLORTRANS=.*/PIXELPILOT_LIVE_COLORTRANS=\"\"/" /etc/default/pixelpilot
-        fi
+    "set gs system connector"*)
+        : # noop
         ;;
     "set gs system resolution"*)
-        sed -i "s/^PIXELPILOT_SCREEN_MODE=.*/PIXELPILOT_SCREEN_MODE=\"$5\"/" /etc/default/pixelpilot
+        sed -i "s/^screen_mode =.*/screen_mode = $5/" /config/setup.txt
         ;;
     "set gs system video_scale"*)
-        sed -i "s/^PIXELPILOT_VIDEO_SCALE=.*/PIXELPILOT_VIDEO_SCALE=$5/" /etc/default/pixelpilot
+        sed -i "s/^video_scale =.*/video_scale = $5/" /config/setup.txt
         ;;
     "set gs system rec_fps"*)
-        sed -i "s/^PIXELPILOT_DVR_FRAMERATE=.*/PIXELPILOT_DVR_FRAMERATE=$5/" /etc/default/pixelpilot
+        sed -i "s/^rec_fps =.*/rec_fps = $5/" /config/setup.txt
         ;;
     "set gs system rec_enabled"*)
         if [ "$5" = "off" ]; then
@@ -823,56 +892,90 @@ EOF
             : #noop
         fi
         ;;
+    "get gs system dvr_also_start_drone_recording"*)
+        if grep -q '^dvr_also_start_drone_recording =' /config/setup.txt; then
+            grep '^dvr_also_start_drone_recording =' /config/setup.txt | awk '{print $3}'
+        else
+            echo 0
+        fi
+        ;;
     "set gs system dvr_also_start_drone_recording"*)
         value=0
         if [ "$5" = "on" ]; then
             value=1
         fi
-        if grep -q '^PIXELPILOT_DVR_ALSO_START_DRONE_RECORDING=' /etc/default/pixelpilot; then
-            sed -i "s/^PIXELPILOT_DVR_ALSO_START_DRONE_RECORDING=.*/PIXELPILOT_DVR_ALSO_START_DRONE_RECORDING=\"$value\"/" /etc/default/pixelpilot
+        if grep -q '^dvr_also_start_drone_recording =' /config/setup.txt; then
+            sed -i "s/^dvr_also_start_drone_recording =.*/dvr_also_start_drone_recording = $value/" /config/setup.txt
         else
-            echo "PIXELPILOT_DVR_ALSO_START_DRONE_RECORDING=\"$value\"" >> /etc/default/pixelpilot
+            echo "dvr_also_start_drone_recording = $value" >> /config/setup.txt
         fi
+        ;;
+    "set gs system drone_recording"*)
+        # Called from the drone-follow pthread in gs_system.c.
+        # REMOTE_IP is already set in the environment by setenv() in gsmenu_toggle_rxmode().
+        # API_BASE_URL is derived from REMOTE_IP at startup, so waybeam helpers reach the
+        # correct drone IP without any extra routing needed here.
+        waybeam_record_set_with_retry_bg "$5"
+        ;;
+    "get gs system dvr_mode"*)
+        echo "raw"
+        emit_values "raw\nreencode\nboth"
         ;;
     "set gs system dvr_mode"*)
-        sed -i "s/^PIXELPILOT_DVR_MODE=.*/PIXELPILOT_DVR_MODE=\"$5\"/" /etc/default/pixelpilot
+        : # noop
+        ;;
+    "get gs system dvr_max_size"*)
+        echo -n "40" # will be multiplied by 100
+        emit_values "1 40"
         ;;
     "set gs system dvr_max_size"*)
-        sed -i "s/^PIXELPILOT_DVR_MAX_SIZE=.*/PIXELPILOT_DVR_MAX_SIZE=\"$(( $5 * 100 ))\"/" /etc/default/pixelpilot
+        : # noop needs division by 100
         ;;
-    "set gs system dvr_reenc_resolution"*)
-        sed -i "s/^PIXELPILOT_DVR_RESOLUTION=.*/PIXELPILOT_DVR_RESOLUTION=\"$5\"/" /etc/default/pixelpilot
+    "get gs system dvr_reenc_codec"*)
+        echo -n "h264"
+        emit_values "h264\nh265"
         ;;
     "set gs system dvr_reenc_codec"*)
-        sed -i "s/^PIXELPILOT_DVR_CODEC=.*/PIXELPILOT_DVR_CODEC=\"$5\"/" /etc/default/pixelpilot
+        : # noop
+        ;;
+    "get gs system dvr_reenc_resolution"*)
+        echo -n "1080p"
+        emit_values "720p\n1080p"
+        ;;
+    "set gs system dvr_reenc_resolution"*)
+        : # noop
+        ;;
+    "get gs system dvr_reenc_fps"*)
+        echo -n "60"
+        emit_values "30\n60"
         ;;
     "set gs system dvr_reenc_fps"*)
-        sed -i "s/^PIXELPILOT_DVR_FPS=.*/PIXELPILOT_DVR_FPS=\"$5\"/" /etc/default/pixelpilot
+        : # noop
+        ;;
+    "get gs system dvr_reenc_bitrate"*)
+        echo -n "10000"
+        emit_values "5000\n10000\n15000\n20000\n25000\n30000\n35000\n40000\n45000\n50000"
         ;;
     "set gs system dvr_reenc_bitrate"*)
-        sed -i "s/^PIXELPILOT_DVR_BITRATE=.*/PIXELPILOT_DVR_BITRATE=\"$5\"/" /etc/default/pixelpilot
+        : # noop
         ;;
     "set gs system dvr_osd"*)
-        if [ "$5" = "on" ]; then
-            sed -i "s/^PIXELPILOT_DVR_OSD=.*/PIXELPILOT_DVR_OSD=\"--dvr-osd\"/" /etc/default/pixelpilot
-        else
-            sed -i "s/^PIXELPILOT_DVR_OSD=.*/PIXELPILOT_DVR_OSD=\"\"/" /etc/default/pixelpilot
-        fi
+        : # noop
         ;;
 
 # ── GS: APFPV ───────────────────────────────────────────────────────────────
 
     "get gs apfpv ssid")
-        grep ssid /etc/wpa_supplicant.apfpv.conf  | cut -d \" -f 2
+        nmcli  c show apfpv0 | grep "802-11-wireless.ssid" | cut -d : -f2 | awk ' {print $1}'
         ;;
     "get gs apfpv password")
-        grep psk /etc/wpa_supplicant.apfpv.conf  | cut -d \" -f 2
+        nmcli -t connection show apfpv0 --show-secrets | grep 802-11-wireless-security.psk: | cut -d : -f2
         ;;
     "get gs apfpv wlx"*)
-        grep -q "^auto $4" /etc/network/interfaces.d/$4 && echo 1 || echo 0
+        grep -q autoconnect=false $(grep -l $4 /etc/NetworkManager/system-connections/apfpv*.nmconnection) && echo 0 || echo 1
         ;;
     "get gs apfpv status wlx"*)
-        iw dev $5 link | grep -q "Not connected." && echo Disconnected || echo Connected
+        nmcli -t device status | grep $5 | grep -q :connected: && echo Connected || echo Disconnected
         ;;
 
     "set gs apfpv ssid"*)
@@ -880,14 +983,15 @@ EOF
             $SSH 'fw_setenv wlanssid "'$5'"'
             $SSH '(hostapd_cli -i wlan0 set ssid "'$5'"; hostapd_cli -i wlan0 reload)  >/dev/null 2>&1 &'
         fi
-        sed -i "s/ssid=.*/ssid=\""$5"\"/" /etc/wpa_supplicant.apfpv.conf
-        WIFI_IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep '^wlx')
+        WIFI_IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep '^wlx' | grep -v "^$EXCLUDE_IFACE$")
         INDEX=0
         for IFACE in $WIFI_IFACES; do
-            if [ $($0 get gs apfpv $IFACE) = 1 ]; then
-                ifdown $IFACE
-                sleep 1
-                ifup $IFACE
+            CONN_NAME="apfpv$INDEX"
+            if nmcli connection show "$CONN_NAME" &>/dev/null; then
+                nmcli connection modify "$CONN_NAME" ssid "$5"
+                if [ $($0 get gs apfpv $IFACE) = 1 ]; then
+                    nmcli -w 0 connection up "$CONN_NAME"
+                fi
             fi
             INDEX=$((INDEX + 1))
         done
@@ -897,225 +1001,176 @@ EOF
             $SSH 'fw_setenv wlanpass "'$5'"'
             $SSH '(hostapd_cli -i wlan0 set wpa_passphrase "'$5'"; hostapd_cli -i wlan0 reload)  >/dev/null 2>&1 &'
         fi
-        sed -i "s/psk=.*/psk=\""$5"\"/" /etc/wpa_supplicant.apfpv.conf
-        WIFI_IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep '^wlx')
+        WIFI_IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep '^wlx' | grep -v "^$EXCLUDE_IFACE$")
         INDEX=0
         for IFACE in $WIFI_IFACES; do
-            if [ $($0 get gs apfpv $IFACE) = 1 ]; then
-                ifdown $IFACE
-                sleep 1
-                ifup $IFACE
+            CONN_NAME="apfpv$INDEX"
+            if nmcli connection show "$CONN_NAME" &>/dev/null; then
+                nmcli connection modify "$CONN_NAME" wifi-sec.psk "$5"
+                if [ $($0 get gs apfpv $IFACE) = 1 ]; then
+                    nmcli -w 0 connection up "$CONN_NAME"
+                fi
             fi
             INDEX=$((INDEX + 1))
         done
         ;;
     "set gs apfpv wlx"*)
+        conn=$(basename -s .nmconnection $(grep -l $4 /etc/NetworkManager/system-connections/apfpv*.nmconnection))
         if [ $5 = "on" ]; then
-            sed -i "s/^#auto/auto/" /etc/network/interfaces.d/$4
-            ifup $4
+            nmcli connection modify "$conn" connection.autoconnect yes
+            nmcli connection up "$conn"
         else
-            sed -i "s/^auto/#auto/" /etc/network/interfaces.d/$4
-            ifdown $4
+            nmcli connection modify "$conn" connection.autoconnect no
+            nmcli connection down "$conn"
             DRV_PATH=$(readlink -f /sys/class/net/$4/device/driver 2>/dev/null || true)
             DEV_PATH=$(readlink -f /sys/class/net/$4/device 2>/dev/null || true)
             DRV_NAME=$(basename "$DRV_PATH")
             DEV_NAME=$(basename "$DEV_PATH")
-            echo -n "$DEV_NAME" > /sys/bus/usb/drivers/$DRV_NAME/unbind >/dev/null
+            echo -n "$DEV_NAME" | sudo tee /sys/bus/usb/drivers/$DRV_NAME/unbind >/dev/null
             sleep 1
-            echo -n "$DEV_NAME" > /sys/bus/usb/drivers/$DRV_NAME/bind >/dev/null
+            echo -n "$DEV_NAME" | sudo tee /sys/bus/usb/drivers/$DRV_NAME/bind >/dev/null
             sleep 1
         fi
         ;;
     "set gs apfpv reset")
-        for CONN in /etc/network/interfaces.d/wlx*; do
-            ifdown $(basename $CONN)
-            rm $CONN
+        CONNECTIONS=$(nmcli -t c show  | grep ^apfpv | cut -d : -f1)
+        for CONN_NAME in $CONNECTIONS; do
+            if nmcli connection show "$CONN_NAME" &>/dev/null; then
+                nmcli connection down "$CONN_NAME"
+                nmcli connection delete "$CONN_NAME"
+            fi
         done
         ;;
 
 # ── GS: WiFi ────────────────────────────────────────────────────────────────
 
     "get gs wifi hotspot")
-        if [ -f /etc/wpa_supplicant.hotspot.conf ] && ip addr show wlan0 2>/dev/null | grep -q "inet "; then
-            echo 1
-        else
-            echo 0
-        fi
+        nmcli connection show --active | grep -q "Hotspot" && echo 1 || echo 0
         ;;
     "get gs wifi wlan")
-        [ ! -d /sys/class/net/wlan0 ] && { echo 0; exit 0; }
-        # Hotspot uses wlan0 in AP mode — not a managed client connection
-        [ -f /etc/wpa_supplicant.hotspot.conf ] && { echo 0; exit 0; }
-        iw dev wlan0 link 2>/dev/null | grep -q "^Connected" && echo 1 || echo 0
+        connection=$(nmcli -t connection show --active | grep wlan0 | grep -v Hotspot | cut -d : -f1)
+        [ -z "${connection}" ] && echo 0 || echo 1
         ;;
     "get gs wifi ssid")
-        [ ! -d /sys/class/net/wlan0 ] && { echo -n ""; exit 0; }
-        [ -f /etc/wpa_supplicant.hotspot.conf ] && { echo -n ""; exit 0; }
-        iw dev wlan0 link 2>/dev/null | awk '/SSID:/ { sub(/.*SSID: /, ""); print; exit }'
+        if [ -d /sys/class/net/wlan0 ]; then
+            nmcli -t connection show --active | grep wlan0 | grep -v Hotspot | cut -d : -f1
+        else
+            echo -n ""
+        fi
         ;;
     "get gs wifi password")
-        if [ -f /etc/wpa_supplicant.conf ]; then
-            grep psk /etc/wpa_supplicant.conf | cut -d = -f 2 | cut -d \" -f 2
+        if [ -d /sys/class/net/wlan0 ]; then
+            connection=$(nmcli -t connection show --active | grep wlan0 | cut -d : -f1)
+            nmcli -t connection show $connection --show-secrets | grep 802-11-wireless-security.psk: | cut -d : -f2
         else
             echo -n ""
         fi
         ;;
     "get gs wifi IP")
-        ip -4 addr show | grep "inet " | awk '{print $2}'
+        ip -4 addr show  | grep -oP '(?<=inet\s)\d+(\.\d+){3}'
         ;;
     "get gs wifi savednetworks")
-        # Read saved networks from wpa_supplicant.conf (multi-stanza, one per known network)
-        if [ -f /etc/wpa_supplicant.conf ]; then
-            awk -F'"' '
-                /ssid=/  { ssid=$2 }
-                /psk=/   { psk=$2  }
-                /}/      {
-                    if (ssid != "" && psk != "") {
-                        s = ssid; gsub(/:/, "\\:", s)
-                        print s ":" psk
-                    }
-                    ssid=""; psk=""
-                }
-            ' /etc/wpa_supplicant.conf
-        fi
+        # Enumerate saved WiFi connection profiles and output ESCAPED_SSID:password
+        nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep ":802-11-wireless$" | \
+        sed 's/:802-11-wireless$//' | \
+        while IFS= read -r name; do
+            ssid=$(nmcli -s -t -f 802-11-wireless.ssid connection show "$name" 2>/dev/null | cut -d: -f2-)
+            psk=$(nmcli -s -t -f 802-11-wireless-security.psk connection show "$name" 2>/dev/null | cut -d: -f2-)
+            [ -z "$ssid" ] && continue
+            escaped=$(printf '%s' "$ssid" | sed 's/:/\\:/g')
+            printf '%s:%s\n' "$escaped" "$psk"
+        done
         ;;
     "get gs wifi networks")
         [ ! -d /sys/class/net/wlan0 ] && exit 0
-        ip link set wlan0 up 2>/dev/null || true
-        # Trigger a fresh scan via iw and parse the BSS list
-        iw dev wlan0 scan 2>/dev/null | awk '
-            BEGIN { ssid=""; sec="--"; sig_pct=0 }
-            /^BSS / {
-                if (ssid != "") {
-                    s = ssid; gsub(/:/, "\\:", s)
-                    printf "%s:%s:%d\n", s, sec, sig_pct
+        # Output ESCAPED_SSID:SECURITY:SIGNAL per line (nmcli already escapes ':' in SSIDs)
+        # Use NF-based split so SSIDs with colons are reconstructed correctly
+        nmcli -t -f SSID,SECURITY,SIGNAL device wifi list 2>/dev/null | \
+        awk -F: '
+            {
+                signal = $NF
+                security = $(NF-1)
+                ssid = ""
+                for (i = 1; i <= NF-2; i++) {
+                    if (i > 1) ssid = ssid ":"
+                    ssid = ssid $i
                 }
-                ssid=""; sec="--"; sig_pct=0
+                if (ssid == "") next
+                sec = (security == "--") ? "--" : "WPA"
+                print ssid ":" sec ":" signal
             }
-            /SSID: / {
-                idx = index($0, "SSID: ")
-                if (idx > 0) ssid = substr($0, idx + 6)
-            }
-            /signal: / {
-                sig = $2 + 0
-                sig_pct = int(2 * (sig + 100))
-                if (sig_pct < 0) sig_pct = 0
-                if (sig_pct > 100) sig_pct = 100
-            }
-            /RSN:/ || /WPA:/ { sec = "WPA" }
-            END {
-                if (ssid != "") {
-                    s = ssid; gsub(/:/, "\\:", s)
-                    printf "%s:%s:%d\n", s, sec, sig_pct
-                }
-            }
-        ' || true
+        '
         ;;
     "set gs wifi connect"*)
         [ ! -d /sys/class/net/wlan0 ] && exit 0
-        SSID="$5"
-        PASSWORD="$6"
-        # Save/update this network in the persistent multi-network conf
-        wpa_conf_update_network "$SSID" "$PASSWORD"
-        # Tear down hotspot if active
-        if [ -f /etc/wpa_supplicant.hotspot.conf ]; then
-            ifdown wlan0 2>/dev/null || true
-            rm -f /etc/wpa_supplicant.hotspot.conf
-        fi
-        # Write a single-network conf so wpa_supplicant only connects to the target
-        if [ -z "$PASSWORD" ]; then
-            printf 'network={\n    ssid="%s"\n    key_mgmt=NONE\n}\n' "$SSID" > /etc/wpa_supplicant.conf.single
+        if nmcli connection show | grep -q "$5"; then
+            nmcli con up "$5"
         else
-            printf 'network={\n    ssid="%s"\n    psk="%s"\n}\n' "$SSID" "$PASSWORD" > /etc/wpa_supplicant.conf.single
+            nmcli device wifi connect "$5" $( [ -n "$6" ] && printf 'password "%s"' "$6" ) ifname wlan0
         fi
-        # Swap in single-network conf, reconnect, then restore full conf
-        # (wpa_supplicant reads conf at startup only; stays on target after restore)
-        cp /etc/wpa_supplicant.conf /etc/wpa_supplicant.conf.bak 2>/dev/null || true
-        cp /etc/wpa_supplicant.conf.single /etc/wpa_supplicant.conf
-        printf 'auto wlan0\niface wlan0 inet dhcp\n    wpa-conf /etc/wpa_supplicant.conf\n' > /etc/network/interfaces.d/wlan0
-        ifdown wlan0 2>/dev/null || true
-        ifup wlan0
-        # Restore full multi-network conf on disk (wpa_supplicant keeps in-memory config)
-        [ -f /etc/wpa_supplicant.conf.bak ] && mv /etc/wpa_supplicant.conf.bak /etc/wpa_supplicant.conf
-        rm -f /etc/wpa_supplicant.conf.single
         ;;
     "set gs wifi disconnect"*)
         [ ! -d /sys/class/net/wlan0 ] && exit 0
-        ifdown wlan0 2>/dev/null || true
-        # Remove interfaces entry to disable auto-reconnect at boot
-        rm -f /etc/network/interfaces.d/wlan0
+        connection=$(nmcli -t connection show --active | grep wlan0 | grep -v Hotspot | cut -d : -f1)
+        [ -n "$connection" ] && nmcli con down "$connection" || true
         ;;
 
     "set gs wifi wlan"*)
         [ ! -d /sys/class/net/wlan0 ] && exit 0
         if [ "$5" = "on" ]; then
-            # Tear down hotspot if active
-            if [ -f /etc/wpa_supplicant.hotspot.conf ]; then
-                ifdown wlan0 2>/dev/null || true
-                rm -f /etc/wpa_supplicant.hotspot.conf
+            if nmcli connection show | grep -q "$6"; then
+                echo "$6 connection exists. Starting it..."
+                nmcli con up "$6"
+            else
+                echo "Creating new "$6" connection..."
+                nmcli device wifi connect "$6" password "$7" ifname wlan0
+                echo "Starting Wlan..."
+                nmcli con up "$6"
             fi
-            wpa_conf_update_network "$6" "$7"
-            printf 'auto wlan0\niface wlan0 inet dhcp\n    wpa-conf /etc/wpa_supplicant.conf\n' > /etc/network/interfaces.d/wlan0
-            ifdown wlan0 2>/dev/null || true
-            ifup wlan0
         else
-            ifdown wlan0 2>/dev/null || true
-            rm -f /etc/network/interfaces.d/wlan0
+            nmcli con down "$6"
         fi
         ;;
     "set gs wifi hotspot"*)
         [ ! -d /sys/class/net/wlan0 ] && exit 0
         if [ "$5" = "on" ]; then
-            [ -f /etc/wpa_supplicant.hotspot.conf ] && ip addr show wlan0 2>/dev/null | grep -q "inet " && exit 0  # already on, nothing to do
-            ifdown wlan0 2>/dev/null || true
-            rm -f /etc/network/interfaces.d/wlan0
-            cat <<EOF > /etc/wpa_supplicant.hotspot.conf
-network={
-    mode=2
-    frequency=2412
-    ssid="OpenIPC GS"
-    psk="12345678"
-}
-EOF
-            cat <<EOF > /etc/network/interfaces.d/wlan0
-iface wlan0 inet static
-    address 192.168.4.1
-    netmask 255.255.255.0
-    post-up udhcpd -S
-    pre-down killall -q udhcpd
-    wpa-conf /etc/wpa_supplicant.hotspot.conf
-EOF
-            ifup wlan0
+            nmcli connection show --active | grep -q "Hotspot" && exit 0  # already on
+            if nmcli connection show | grep -q "Hotspot"; then
+                echo "Hotspot connection exists. Starting it..."
+                nmcli con up Hotspot
+            else
+                echo "Creating new Hotspot connection..."
+                nmcli con add type wifi ifname wlan0 con-name Hotspot autoconnect no ssid "OpenIPC GS"
+                nmcli con modify Hotspot 802-11-wireless.mode ap 802-11-wireless.band bg ipv4.method shared
+                nmcli con modify Hotspot wifi-sec.key-mgmt wpa-psk
+                nmcli con modify Hotspot wifi-sec.psk "openipcgs"
+                nmcli con modify Hotspot ipv4.addresses 192.168.4.1/24
+                echo "Starting Hotspot..."
+                nmcli con up Hotspot
+            fi
         else
-            [ ! -f /etc/wpa_supplicant.hotspot.conf ] && exit 0  # already off, nothing to do
-            ifdown wlan0 2>/dev/null || true
-            rm -f /etc/network/interfaces.d/wlan0
-            rm -f /etc/wpa_supplicant.hotspot.conf
+            nmcli connection show --active | grep -q "Hotspot" || exit 0  # already off
+            nmcli con down Hotspot
         fi
         ;;
 
 # ── GS: Main page (info labels) ─────────────────────────────────────────────
 
     "get gs main Channel")
-        gsmenu.sh get gs wfbng gs_channel | head -1
+        gsmenu.sh get gs wfbng gs_channel
         ;;
     "get gs main HDMI-OUT")
-        gsmenu.sh get gs system resolution | head -1
+        gsmenu.sh get gs system resolution
         ;;
     "get gs main Version")
-        . /etc/os-release
-        echo $PRETTY_NAME $VERSION
+        cat /config/version.md
         ;;
     "get gs main Disk")
-        df -h /media/dvr | awk 'NR==2 {print $2, $4, $5}' | while read -r size avail pcent
-        do
-            echo -e "\n   Size: $size\n   Available: $avail\n   Pct: $pcent\c"
-            exit 0
-        done
+        read -r size avail pcent <<< $(df -h / | awk 'NR==2 {print $2, $4, $5}')
+        echo -e "\n   Size: $size\n   Available: $avail\n   Pct: $pcent\c"
         ;;
     "get gs main WFB_NICS")
-        . /etc/default/wifibroadcast
-        echo $WFB_NICS
+        grep ^WFB_NICS /etc/default/wifibroadcast | cut -d \" -f 2
         ;;
 
 # ── Buttons / Actions ───────────────────────────────────────────────────────
@@ -1130,6 +1185,16 @@ EOF
         echo "Not implmented"
         echo "Not implmented" >&2
         exit 1
+        ;;
+
+# ── NetworkManager Dispatcher ────────────────────────────────────────────────
+
+    "wlx"*"dhcp4-change")
+        eval $(udevadm info -x --query=property --path=/sys/class/net/$DEVICE_IFACE)
+        case "$ID_NET_DRIVER" in
+        "rtl88xxau_wfb") iw dev "$DEVICE_IFACE" set txpower fixed -4000 ;;
+        "rtl88x2eu")     iw dev "$DEVICE_IFACE" set txpower fixed 2500  ;;
+        esac
         ;;
 
 # ── Unknown command ──────────────────────────────────────────────────────────
