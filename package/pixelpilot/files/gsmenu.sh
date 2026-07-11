@@ -5,7 +5,7 @@ set -o pipefail
 # Configuration
 # ══════════════════════════════════════════════════════════════════════════════
 
-REMOTE_IP="${REMOTE_IP:-10.5.0.10}"
+REMOTE_IP="${REMOTE_IP:-waybeam.local}"
 AIR_FIRMWARE_TYPE="${AIR_FIRMWARE_TYPE:-wfb}"
 SSH_PASS="12345"
 CACHE_DIR="/tmp/gsmenu_cache"
@@ -890,31 +890,6 @@ case "$@" in
         else
             : #noop
         fi
-        ;;
-    "get gs system dvr_also_start_drone_recording"*)
-        if grep -q '^dvr_also_start_drone_recording =' /config/setup.txt; then
-            grep '^dvr_also_start_drone_recording =' /config/setup.txt | awk '{print $3}'
-        else
-            echo 0
-        fi
-        ;;
-    "set gs system dvr_also_start_drone_recording"*)
-        value=0
-        if [ "$5" = "on" ]; then
-            value=1
-        fi
-        if grep -q '^dvr_also_start_drone_recording =' /config/setup.txt; then
-            sed -i "s/^dvr_also_start_drone_recording =.*/dvr_also_start_drone_recording = $value/" /config/setup.txt
-        else
-            echo "dvr_also_start_drone_recording = $value" >> /config/setup.txt
-        fi
-        ;;
-    "set gs system drone_recording"*)
-        # Called from the drone-follow pthread in gs_system.c.
-        # REMOTE_IP is already set in the environment by setenv() in gsmenu_toggle_rxmode().
-        # API_BASE_URL is derived from REMOTE_IP at startup, so waybeam helpers reach the
-        # correct drone IP without any extra routing needed here.
-        waybeam_record_set_with_retry_bg "$5"
         ;;
     "get gs system dvr_mode"*)
         echo "raw"
